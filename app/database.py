@@ -1,0 +1,404 @@
+"""
+Firebase Firestore database layer
+Handles all database operations with proper error handling
+"""
+import firebase_admin
+from firebase_admin import credentials, firestore
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import structlog
+
+from app.config import settings
+from app.models import Scholarship, UserProfile
+
+logger = structlog.get_logger()
+
+
+class FirebaseDB:
+    """Firebase Firestore database manager"""
+    
+    def __init__(self):
+        """Initialize Firebase Admin SDK"""
+        try:
+            # Check if already initialized
+            firebase_admin.get_app()
+            logger.info("Firebase already initialized")
+        except ValueError:
+            # Initialize Firebase
+            cred = credentials.Certificate(settings.firebase_credentials)
+            firebase_admin.initialize_app(cred)
+            logger.info("Firebase initialized successfully")
+        
+        self.db = firestore.client()
+    
+    # User Profile Operations
+    async def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch user profile from Firestore"""
+        try:
+            doc_ref = self.db.collection('users').document(user_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            return None
+        except Exception as e:
+            logger.error("Failed to fetch user profile", user_id=user_id, error=str(e))
+            raise
+    
+    async def update_user_profile(self, user_id: str, profile: UserProfile) -> bool:
+        """Update user profile in Firestore"""
+        try:
+            doc_ref = self.db.collection('users').document(user_id)
+            doc_ref.update({
+                'profile': profile.model_dump(),
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            logger.info("User profile updated", user_id=user_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to update user profile", user_id=user_id, error=str(e))
+            raise
+    
+    # Scholarship Operations
+    async def save_scholarship(self, scholarship: Scholarship) -> bool:
+        """Save scholarship to Firestore"""
+        try:
+            doc_ref = self.db.collection('scholarships').document(scholarship.id)
+            doc_ref.set(scholarship.model_dump())
+            logger.info("Scholarship saved", scholarship_id=scholarship.id)
+            return True
+        except Exception as e:
+            logger.error("Failed to save scholarship", scholarship_id=scholarship.id, error=str(e))
+            raise
+    
+    async def get_scholarship(self, scholarship_id: str) -> Optional[Scholarship]:
+        """Fetch single scholarship by ID"""
+        try:
+            doc_ref = self.db.collection('scholarships').document(scholarship_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                return Scholarship(**data)
+            return None
+        except Exception as e:
+            logger.error("Failed to fetch scholarship", scholarship_id=scholarship_id, error=str(e))
+            raise
+    
+    async def get_all_scholarships(self) -> List[Scholarship]:
+        """Fetch all scholarships from cache"""
+        try:
+            docs = self.db.collection('scholarships').stream()
+            scholarships = []
+            
+            for doc in docs:
+                try:
+                    scholarships.append(Scholarship(**doc.to_dict()))
+                except Exception as parse_error:
+                    logger.warning("Failed to parse scholarship", doc_id=doc.id, error=str(parse_error))
+                    continue
+            
+            logger.info("Fetched scholarships", count=len(scholarships))
+            return scholarships
+        except Exception as e:
+            logger.error("Failed to fetch all scholarships", error=str(e))
+            raise
+    
+    async def get_user_matched_scholarships(self, user_id: str) -> List[Scholarship]:
+        """Fetch scholarships matched to a specific user"""
+        try:
+            # Get user's matched scholarship IDs
+            doc_ref = self.db.collection('user_matches').document(user_id)
+            doc = doc_ref.get()
+            
+            if not doc.exists:
+                logger.info("No matched scholarships found", user_id=user_id)
+                return []
+            
+            matched_ids = doc.to_dict().get('scholarship_ids', [])
+            
+            # Fetch scholarship details
+            scholarships = []
+            for scholarship_id in matched_ids:
+                scholarship = await self.get_scholarship(scholarship_id)
+                if scholarship:
+                    scholarships.append(scholarship)
+            
+            logger.info("Fetched user matched scholarships", user_id=user_id, count=len(scholarships))
+            return scholarships
+        except Exception as e:
+            logger.error("Failed to fetch user matched scholarships", user_id=user_id, error=str(e))
+            raise
+    
+    async def save_user_matches(self, user_id: str, scholarship_ids: List[str]) -> bool:
+        """Save matched scholarship IDs for a user"""
+        try:
+            doc_ref = self.db.collection('user_matches').document(user_id)
+            doc_ref.set({
+                'scholarship_ids': scholarship_ids,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            logger.info("User matches saved", user_id=user_id, count=len(scholarship_ids))
+            return True
+        except Exception as e:
+            logger.error("Failed to save user matches", user_id=user_id, error=str(e))
+            raise
+    
+    # Saved Scholarships Operations
+    async def save_user_scholarship(self, user_id: str, scholarship_id: str) -> bool:
+        """Add scholarship to user's saved list"""
+        try:
+            doc_ref = self.db.collection('users').document(user_id)
+            # Use set with merge to create document if it doesn't exist
+            doc_ref.set({
+                'saved_scholarships': firestore.ArrayUnion([scholarship_id]),
+                'updated_at': firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            logger.info("Scholarship saved to user favorites", user_id=user_id, scholarship_id=scholarship_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to save scholarship to favorites", user_id=user_id, error=str(e))
+            raise
+    
+    async def unsave_user_scholarship(self, user_id: str, scholarship_id: str) -> bool:
+        """Remove scholarship from user's saved list"""
+        try:
+            doc_ref = self.db.collection('users').document(user_id)
+            # Use set with merge to ensure document exists
+            doc_ref.set({
+                'saved_scholarships': firestore.ArrayRemove([scholarship_id]),
+                'updated_at': firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            logger.info("Scholarship removed from user favorites", user_id=user_id, scholarship_id=scholarship_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to remove scholarship from favorites", user_id=user_id, error=str(e))
+            raise
+    
+    # Application Tracking & Management
+    async def start_application(self, user_id: str, scholarship_id: str) -> str:
+        """Track that user started an application, returns application_id"""
+        try:
+            # Check if draft already exists
+            existing = self.db.collection('applications')\
+                .where('user_id', '==', user_id)\
+                .where('scholarship_id', '==', scholarship_id)\
+                .where('status', '==', 'draft')\
+                .limit(1)\
+                .stream()
+            
+            for doc in existing:
+                logger.info("Returning existing draft", application_id=doc.id)
+                return doc.id
+            
+            # Create new draft
+            doc_ref = self.db.collection('applications').document()
+            application_id = doc_ref.id
+            
+            doc_ref.set({
+                'application_id': application_id,
+                'user_id': user_id,
+                'scholarship_id': scholarship_id,
+                'status': 'draft',
+                'current_step': 1,
+                'progress_percentage': 0.0,
+                'personal_info': None,
+                'documents': [],
+                'essays': [],
+                'recommenders': [],
+                'additional_answers': {},
+                'created_at': firestore.SERVER_TIMESTAMP,
+                'updated_at': firestore.SERVER_TIMESTAMP,
+                'last_saved': firestore.SERVER_TIMESTAMP
+            })
+            
+            logger.info("Application draft created", application_id=application_id, user_id=user_id, scholarship_id=scholarship_id)
+            return application_id
+        except Exception as e:
+            logger.error("Failed to start application", user_id=user_id, error=str(e))
+            raise
+    
+    async def save_application_draft(self, application_id: str, draft_data: Dict[str, Any]) -> bool:
+        """Save application draft with auto-save data"""
+        try:
+            doc_ref = self.db.collection('applications').document(application_id)
+            
+            # Update only provided fields
+            update_data = {
+                'updated_at': firestore.SERVER_TIMESTAMP,
+                'last_saved': firestore.SERVER_TIMESTAMP
+            }
+            
+            if 'current_step' in draft_data:
+                update_data['current_step'] = draft_data['current_step']
+            if 'progress_percentage' in draft_data:
+                update_data['progress_percentage'] = draft_data['progress_percentage']
+            if 'personal_info' in draft_data and draft_data['personal_info'] is not None:
+                update_data['personal_info'] = draft_data['personal_info']
+            if 'documents' in draft_data and draft_data['documents'] is not None:
+                update_data['documents'] = draft_data['documents']
+            if 'essays' in draft_data and draft_data['essays'] is not None:
+                update_data['essays'] = draft_data['essays']
+            if 'recommenders' in draft_data and draft_data['recommenders'] is not None:
+                update_data['recommenders'] = draft_data['recommenders']
+            if 'additional_answers' in draft_data and draft_data['additional_answers'] is not None:
+                update_data['additional_answers'] = draft_data['additional_answers']
+            
+            doc_ref.update(update_data)
+            logger.info("Application draft saved", application_id=application_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to save draft", application_id=application_id, error=str(e))
+            raise
+    
+    async def get_application_draft(self, user_id: str, scholarship_id: str) -> Optional[Dict[str, Any]]:
+        """Get application draft for resume"""
+        try:
+            docs = self.db.collection('applications')\
+                .where('user_id', '==', user_id)\
+                .where('scholarship_id', '==', scholarship_id)\
+                .where('status', '==', 'draft')\
+                .limit(1)\
+                .stream()
+            
+            for doc in docs:
+                return doc.to_dict()
+            
+            return None
+        except Exception as e:
+            logger.error("Failed to get draft", user_id=user_id, scholarship_id=scholarship_id, error=str(e))
+            raise
+    
+    async def submit_application(self, application_data: Dict[str, Any]) -> str:
+        """Submit final application and generate confirmation number"""
+        try:
+            import secrets
+            
+            # Generate confirmation number
+            confirmation_number = f"AS-{datetime.now().year}-{secrets.token_hex(6).upper()}"
+            
+            # Create submission document
+            doc_ref = self.db.collection('applications').document(application_data['application_id'])
+            
+            submission_data = {
+                **application_data,
+                'status': 'submitted',
+                'confirmation_number': confirmation_number,
+                'submitted_at': firestore.SERVER_TIMESTAMP,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            }
+            
+            doc_ref.set(submission_data)
+            logger.info("Application submitted", application_id=application_data['application_id'], confirmation=confirmation_number)
+            
+            return confirmation_number
+        except Exception as e:
+            logger.error("Failed to submit application", error=str(e))
+            raise
+    
+    async def get_user_applications(self, user_id: str) -> List[Dict[str, Any]]:
+        """Get all applications for a user"""
+        try:
+            docs = self.db.collection('applications')\
+                .where('user_id', '==', user_id)\
+                .order_by('updated_at', direction=firestore.Query.DESCENDING)\
+                .stream()
+            
+            applications = []
+            for doc in docs:
+                applications.append(doc.to_dict())
+            
+            logger.info("Fetched user applications", user_id=user_id, count=len(applications))
+            return applications
+        except Exception as e:
+            logger.error("Failed to fetch user applications", user_id=user_id, error=str(e))
+            raise
+    
+    async def get_application_by_id(self, application_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific application by ID"""
+        try:
+            doc_ref = self.db.collection('applications').document(application_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            return None
+        except Exception as e:
+            logger.error("Failed to fetch application", application_id=application_id, error=str(e))
+            raise
+    
+    async def update_application_status(self, application_id: str, status: str, **kwargs) -> bool:
+        """Update application status (for admin or automated updates)"""
+        try:
+            doc_ref = self.db.collection('applications').document(application_id)
+            
+            update_data = {
+                'status': status,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            }
+            
+            # Add optional fields
+            if 'decision_date' in kwargs:
+                update_data['decision_date'] = kwargs['decision_date']
+            if 'award_amount' in kwargs:
+                update_data['award_amount'] = kwargs['award_amount']
+            if 'notes' in kwargs:
+                update_data['notes'] = kwargs['notes']
+            
+            doc_ref.update(update_data)
+            logger.info("Application status updated", application_id=application_id, status=status)
+            return True
+        except Exception as e:
+            logger.error("Failed to update status", application_id=application_id, error=str(e))
+            raise
+    
+    # Discovery Job Tracking
+    async def create_discovery_job(self, user_id: str, job_id: str) -> bool:
+        """Create a discovery job record"""
+        try:
+            doc_ref = self.db.collection('discovery_jobs').document(job_id)
+            doc_ref.set({
+                'user_id': user_id,
+                'status': 'processing',
+                'progress': 0,
+                'scholarships_found': 0,
+                'started_at': firestore.SERVER_TIMESTAMP,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            logger.info("Discovery job created", job_id=job_id, user_id=user_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to create discovery job", job_id=job_id, error=str(e))
+            raise
+    
+    async def update_discovery_job(self, job_id: str, status: str, progress: float, scholarships_found: int) -> bool:
+        """Update discovery job progress"""
+        try:
+            doc_ref = self.db.collection('discovery_jobs').document(job_id)
+            doc_ref.update({
+                'status': status,
+                'progress': progress,
+                'scholarships_found': scholarships_found,
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            return True
+        except Exception as e:
+            logger.error("Failed to update discovery job", job_id=job_id, error=str(e))
+            raise
+    
+    async def get_discovery_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get discovery job status"""
+        try:
+            doc_ref = self.db.collection('discovery_jobs').document(job_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            return None
+        except Exception as e:
+            logger.error("Failed to fetch discovery job", job_id=job_id, error=str(e))
+            raise
+
+
+# Global database instance
+db = FirebaseDB()
